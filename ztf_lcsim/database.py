@@ -29,9 +29,7 @@ class FeatureDatabase:
     Parameters
     ----------
     features_path : str or Path
-        Path to the HDF5 feature file.
     metadata_path : str or Path
-        Path to the SQLite metadata file.
     """
 
     def __init__(
@@ -71,7 +69,6 @@ class FeatureDatabase:
         feature_dict: Dict[str, np.ndarray],
         metadata: Optional[pd.DataFrame] = None,
     ):
-        """Convenience: pass a {oid: feature_vector} dict."""
         oids = list(feature_dict.keys())
         X = np.vstack([feature_dict[o] for o in oids]).astype(np.float32)
         self.add(oids, X, metadata)
@@ -82,11 +79,9 @@ class FeatureDatabase:
         """Load the full feature matrix."""
         if not self.features_path.exists():
             return [], np.empty((0, N_FEATURES), dtype=np.float32)
-
         with h5py.File(self.features_path, "r") as fh:
             raw_oids = fh["oids"][:]
             X = fh["features"][:].astype(np.float32)
-
         oids = [
             o.decode("utf-8") if isinstance(o, (bytes, np.bytes_)) else str(o)
             for o in raw_oids
@@ -94,14 +89,12 @@ class FeatureDatabase:
         return oids, X
 
     def load_features(self, oids: List[str]) -> np.ndarray:
-        """Return feature vectors for a specific list of OIDs."""
         all_oids, X = self.load_all()
         idx_map = {o: i for i, o in enumerate(all_oids)}
         rows = [idx_map[o] for o in oids if o in idx_map]
         return X[rows]
 
     def load_metadata(self, oids: Optional[List[str]] = None) -> pd.DataFrame:
-        """Load metadata from SQLite."""
         con = sqlite3.connect(self.metadata_path)
         try:
             if oids is None:
@@ -110,8 +103,7 @@ class FeatureDatabase:
                 placeholders = ",".join("?" * len(oids))
                 df = pd.read_sql(
                     f"SELECT * FROM objects WHERE oid IN ({placeholders})",
-                    con,
-                    params=oids,
+                    con, params=oids,
                 )
         finally:
             con.close()
@@ -144,8 +136,7 @@ class FeatureDatabase:
             meta = self.load_metadata()
             cls_counts = (
                 meta["cls"].value_counts().to_dict()
-                if "cls" in meta.columns
-                else {}
+                if "cls" in meta.columns else {}
             )
         except Exception:
             cls_counts = {}
@@ -154,17 +145,23 @@ class FeatureDatabase:
     # ── internal helpers ──────────────────────────────────────────────────────
 
     def _hdf_append(self, oids: List[str], features: np.ndarray):
+        """Append rows to HDF5, creating datasets if needed."""
         encoded = [o.encode("utf-8") for o in oids]
-        n_new = len(oids)
+        n_new   = len(oids)
+        mode    = "a" if self.features_path.exists() else "w"
 
-        mode = "a" if self.features_path.exists() else "w"
         with h5py.File(self.features_path, mode) as fh:
             if "oids" not in fh:
-                dt = h5py.string_dtype(encoding="utf-8")
+                # h5py >= 3.0 uses string_dtype; < 3.0 uses special_dtype
+                try:
+                    str_dt = h5py.string_dtype(encoding="utf-8")
+                except AttributeError:
+                    str_dt = h5py.special_dtype(vlen=str)
+
                 fh.create_dataset(
                     "oids",
                     data=np.array(encoded, dtype=object),
-                    dtype=dt,
+                    dtype=str_dt,
                     maxshape=(None,),
                     chunks=(min(_HDF_CHUNK, n_new),),
                     compression=_HDF_COMPRESS,
@@ -178,11 +175,18 @@ class FeatureDatabase:
                     compression=_HDF_COMPRESS,
                     compression_opts=_HDF_COMPRESS_OPT,
                 )
-                fn_enc = [n.encode("utf-8") for n in FEATURE_NAMES]
+                try:
+                    str_dt2 = h5py.string_dtype(encoding="utf-8")
+                except AttributeError:
+                    str_dt2 = h5py.special_dtype(vlen=str)
+
                 fh.create_dataset(
                     "feature_names",
-                    data=np.array(fn_enc, dtype=object),
-                    dtype=dt,
+                    data=np.array(
+                        [n.encode("utf-8") for n in FEATURE_NAMES],
+                        dtype=object,
+                    ),
+                    dtype=str_dt2,
                 )
             else:
                 old_n = fh["oids"].shape[0]
