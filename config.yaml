@@ -1,0 +1,48 @@
+# ──────────────────────────────────────────────
+# ZTF Light Curve Similarity — default config
+# ──────────────────────────────────────────────
+
+database:
+  dir: "./ztf_data"            # root data directory
+  features_file: "features.h5" # HDF5 feature store
+  metadata_file: "metadata.db" # SQLite metadata
+  cache_subdir: "lc_cache"     # light-curve cache
+
+index:
+  file: "similarity.index"
+  # flat   – exact, good for <500 k objects
+  # ivf    – approx, fast for millions
+  # hnsw   – approx, best recall/speed tradeoff
+  type: "flat"
+  metric: "cosine"   # cosine | l2
+  ivf_nlist: 256     # IVF: number of Voronoi cells
+  ivf_nprobe: 32     # IVF: cells to visit at query time
+  hnsw_m: 32         # HNSW: connections per node
+
+alerce:
+  timeout: 30
+  max_retries: 3
+  request_delay: 0.1   # seconds between requests
+
+features:
+  bands: [1, 2]          # 1=g, 2=r  (3=i if available)
+  min_obs_per_band: 5    # skip band if fewer obs
+  ls_min_period: 0.1     # Lomb-Scargle min period (days)
+  ls_max_period: 500.0   # Lomb-Scargle max period (days)
+  ls_samples_per_peak: 5
+
+catalog:
+  classes:
+    - "RRL"
+    - "LPV"
+    - "EB"
+    - "DSCT"
+    - "CEP"
+    - "SNIa"
+    - "SNIbc"
+    - "SNII"
+    - "QSO"
+    - "AGN"
+  min_probability: 0.6
+  max_per_class: 10000
+  n_workers: 4

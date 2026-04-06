@@ -1,0 +1,151 @@
+# ══════════════════════════════════════════════════════════════
+#  ztf_lcsim  —  .gitignore
+#  Rule of thumb: never commit data, models, secrets, or cache
+# ══════════════════════════════════════════════════════════════
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Build / packaging ─────────────────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+MANIFEST
+pip-wheel-metadata/
+.installed.cfg
+lib/
+lib64/
+
+# ── Virtual environments ──────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.env
+.venv*/
+virtualenv/
+
+# ── Jupyter ───────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+profile_default/
+ipython_config.py
+
+# ── IDE / editors ─────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+.project
+.pydevproject
+*.sublime-project
+*.sublime-workspace
+
+# ══════════════════════════════════════════════════════════════
+# PROJECT-SPECIFIC: data, indices, cache, outputs
+# ══════════════════════════════════════════════════════════════
+
+# ── Main data directory (ALL contents) ───────────────────────
+ztf_data/
+
+# ── Light curve cache anywhere in the tree ───────────────────
+lc_cache/
+**/lc_cache/
+
+# ── Large binary / database files (catch-all) ────────────────
+*.h5
+*.hdf5
+*.hdf
+*.db
+*.sqlite
+*.sqlite3
+
+# ── FAISS index files ─────────────────────────────────────────
+*.index
+*.index.faiss
+*.index.meta
+*.faiss
+
+# ── Parquet / Arrow / feather cache ──────────────────────────
+*.parquet
+*.arrow
+*.feather
+
+# ── Pickle / joblib dumps ─────────────────────────────────────
+*.pkl
+*.pickle
+*.joblib
+
+# ── Compressed archives (data dumps) ─────────────────────────
+*.tar.gz
+*.tar.bz2
+*.zip
+*.gz
+*.bz2
+*.7z
+
+# ── Result outputs ────────────────────────────────────────────
+results/
+outputs/
+plots/
+*.pdf
+*.png
+*.svg
+*.eps
+
+# ── Log files ─────────────────────────────────────────────────
+*.log
+logs/
+*.out
+
+# ── Coverage / testing artifacts ──────────────────────────────
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# ── Profiling ─────────────────────────────────────────────────
+*.prof
+*.lprof
+
+# ── MyPy / type checkers ──────────────────────────────────────
+.mypy_cache/
+.dmypy.json
+dmypy.json
+.pyre/
+.pytype/
+
+# ── Secrets / credentials ─────────────────────────────────────
+.env
+.env.*
+secrets.yaml
+secrets.yml
+*credentials*
+*secret*
+*.pem
+*.key
+
+# ── OS junk ───────────────────────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
