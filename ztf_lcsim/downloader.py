@@ -1,5 +1,13 @@
 """
 ALeRCE / ZTF data downloader.
+Verified against ALeRCE REST API 2025-01.
+
+Correct API parameters (from GET /classifiers):
+  classifier : "lc_classifier"
+  class_name : "SNIa" | "SNIbc" | "SNII" | "SLSN" |
+               "AGN"  | "QSO"  | "Blazar" | "CV/Nova" | "YSO" |
+               "RRL"  | "LPV"  | "E" | "DSCT" | "CEP" | "Periodic-Other"
+  probability: float  (0–1)
 """
 
 from __future__ import annotations
@@ -18,31 +26,40 @@ logger = logging.getLogger(__name__)
 
 _ALERCE_API = "https://api.alerce.online/ztf/v1"
 
+# Verified classifier name and class list (GET /classifiers, 2025-01)
+_DEFAULT_CLASSIFIER = "lc_classifier"
+_KNOWN_CLASSIFIERS = [
+    "lc_classifier",
+    "lc_classifier_transient",
+    "lc_classifier_stochastic",
+    "lc_classifier_periodic",
+    "lc_classifier_top",
+    "stamp_classifier",
+]
+
 try:
     from alerce.core import Alerce as _AlerceClient
+
     _HAS_ALERCE = True
 except ImportError:
     _HAS_ALERCE = False
-    logger.warning(
-        "alerce package not found – using REST API directly. "
-        "Install with:  pip install alerce"
-    )
+    logger.warning("alerce package not found – using REST API directly.")
 
 
 class AlerceDownloader:
     """
-    Thin wrapper around the ALeRCE API for ZTF data.
+    Wrapper around the ALeRCE API for ZTF data.
 
     Parameters
     ----------
     cache_dir : str or Path, optional
-        Directory for caching downloaded light curves as Parquet files.
+        Directory for caching light curves as Parquet files.
     timeout : int
-        HTTP request timeout in seconds.
+        HTTP timeout in seconds.
     max_retries : int
-        Number of retries on transient errors.
+        Retries on transient failures.
     request_delay : float
-        Seconds to wait between requests.
+        Seconds between requests (polite rate-limiting).
     """
 
     def __init__(
@@ -50,10 +67,10 @@ class AlerceDownloader:
         cache_dir: Optional[str] = None,
         timeout: int = 30,
         max_retries: int = 3,
-        request_delay: float = 0.1,
+        request_delay: float = 0.15,
     ):
-        self.timeout       = timeout
-        self.max_retries   = max_retries
+        self.timeout = timeout
+        self.max_retries = max_retries
         self.request_delay = request_delay
 
         self._cache_dir: Optional[Path] = None
@@ -66,17 +83,19 @@ class AlerceDownloader:
             try:
                 self._client = _AlerceClient()
             except Exception as exc:
-                logger.warning(f"Could not init alerce client ({exc}); using REST.")
+                logger.warning(f"Could not init alerce client ({exc})")
 
-    # ── light curve access ────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Light curve access
+    # ══════════════════════════════════════════════════════════════════════════
 
     def get_lightcurve(
         self, oid: str, use_cache: bool = True
     ) -> Optional[pd.DataFrame]:
         """
-        Fetch detections for *oid* and return a cleaned DataFrame.
+        Fetch detections for *oid*.
 
-        Guaranteed columns: ``mjd``, ``fid``, ``magpsf``, ``sigmapsf``
+        Guaranteed columns: mjd, fid, magpsf, sigmapsf
         Returns None on failure.
         """
         if use_cache and self._cache_dir is not None:
@@ -104,7 +123,7 @@ class AlerceDownloader:
         use_cache: bool = True,
         show_progress: bool = True,
     ) -> Dict[str, pd.DataFrame]:
-        """Parallel batch download. Returns dict {oid: DataFrame}."""
+        """Parallel batch download. Returns {oid: DataFrame}."""
         results: Dict[str, pd.DataFrame] = {}
 
         def _fetch(oid: str):
@@ -127,24 +146,55 @@ class AlerceDownloader:
         return results
 
     def _download_lightcurve(self, oid: str) -> Optional[pd.DataFrame]:
+        """
+        Download a light curve for *oid*.
+
+        Strategy:
+          1. REST API  — always returns flat DataFrame with correct column names
+          2. alerce client — returns nested structure, we unwrap it
+        """
+        # ── 1. REST API (primary) ─────────────────────────────────────────────────
+        try:
+            r = requests.get(
+                f"{_ALERCE_API}/objects/{oid}/lightcurve",
+                timeout=self.timeout,
+            )
+            if r.ok:
+                data = r.json()
+                dets = data.get("detections", data) if isinstance(data, dict) else data
+                if dets:
+                    df = pd.DataFrame(dets)
+                    if {"mjd", "magpsf", "sigmapsf", "fid"}.issubset(df.columns):
+                        return df
+                    logger.debug(
+                        f"[{oid}] REST cols OK check failed: {list(df.columns)}"
+                    )
+            else:
+                logger.debug(f"[{oid}] REST status={r.status_code}")
+        except Exception as exc:
+            logger.debug(f"[{oid}] REST exception: {exc}")
+
+        # ── 2. alerce client (fallback) — unwrap nested structure ─────────────────
         if self._client is not None:
             try:
-                lc = self._client.query_lightcurve(oid, format="pandas")
-                if lc is not None and not lc.empty:
-                    return lc
+                raw = self._client.query_lightcurve(oid, format="pandas")
+                if raw is not None and not raw.empty:
+                    df = _unwrap_alerce_client_lc(raw, oid)
+                    if df is not None:
+                        return df
             except Exception as exc:
-                logger.debug(f"alerce client failed for {oid}: {exc}")
+                logger.debug(f"[{oid}] client exception: {exc}")
 
-        return self._rest_get(
-            f"/objects/{oid}/lightcurve", result_key="detections"
-        )
+        return None
 
-    # ── catalog / object queries ──────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Catalog / object queries
+    # ══════════════════════════════════════════════════════════════════════════
 
     def query_objects(
         self,
         class_name: Optional[str] = None,
-        classifier: str = "lc_classifier_top",
+        classifier: str = _DEFAULT_CLASSIFIER,
         min_probability: float = 0.6,
         max_objects: Optional[int] = None,
         page_size: int = 1000,
@@ -156,13 +206,24 @@ class AlerceDownloader:
         Parameters
         ----------
         class_name : str, optional
-            e.g. ``"RRL"``, ``"LPV"``, ``"SNIa"``
+            One of the verified class names for the chosen classifier.
+            For "lc_classifier": SNIa, SNIbc, SNII, SLSN,
+                                  AGN, QSO, Blazar, CV/Nova, YSO,
+                                  RRL, LPV, E, DSCT, CEP, Periodic-Other
+        classifier : str
+            Default: "lc_classifier" (verified working 2025-01).
+        min_probability : float
+            Minimum classification probability [0, 1].
+        max_objects : int, optional
+            Stop after this many objects total.
+        page_size : int
+            Objects per API page (max 1000).
         """
         pages: List[pd.DataFrame] = []
         page = 1
 
         pbar = tqdm(
-            desc=f"Querying {class_name or 'all'}",
+            desc=f"Querying {class_name or 'all'} [{classifier}]",
             unit=" obj",
             disable=not show_progress,
         )
@@ -170,18 +231,23 @@ class AlerceDownloader:
         while True:
             batch = self._fetch_with_retry(
                 self._download_object_page,
-                class_name, classifier, min_probability, page, page_size,
+                class_name=class_name,
+                classifier=classifier,
+                min_probability=min_probability,
+                page=page,
+                page_size=page_size,
             )
+
             if batch is None or batch.empty:
                 break
 
             pages.append(batch)
             pbar.update(len(batch))
 
-            total_so_far = sum(len(p) for p in pages)
+            total = sum(len(p) for p in pages)
             if len(batch) < page_size:
                 break
-            if max_objects and total_so_far >= max_objects:
+            if max_objects and total >= max_objects:
                 break
 
             page += 1
@@ -190,7 +256,16 @@ class AlerceDownloader:
         pbar.close()
 
         if not pages:
+            logger.warning(
+                f"No objects returned for class_name={class_name!r}, "
+                f"classifier={classifier!r}, probability>={min_probability}.\n"
+                f"  Verify class names with:  python scripts/diag_alerce.py\n"
+                f"  lc_classifier classes: SNIa, SNIbc, SNII, SLSN, "
+                f"AGN, QSO, Blazar, CV/Nova, YSO, RRL, LPV, E, DSCT, CEP, "
+                f"Periodic-Other"
+            )
             return pd.DataFrame()
+
         df = pd.concat(pages, ignore_index=True)
         if max_objects:
             df = df.head(max_objects)
@@ -204,6 +279,9 @@ class AlerceDownloader:
         page: int,
         page_size: int,
     ) -> Optional[pd.DataFrame]:
+        """Try alerce client first, then REST."""
+
+        # ── alerce Python client ──────────────────────────────────────────────
         if self._client is not None:
             try:
                 kw: dict = dict(
@@ -216,33 +294,53 @@ class AlerceDownloader:
                 if class_name:
                     kw["class_name"] = class_name
                 result = self._client.query_objects(**kw)
-                return result if result is not None else pd.DataFrame()
+                if result is not None and not result.empty:
+                    return result
             except Exception as exc:
-                logger.debug(f"alerce client query_objects failed: {exc}")
+                logger.debug(f"Client query_objects (p{page}): {exc}")
 
+        # ── REST fallback ─────────────────────────────────────────────────────
         params: dict = {
-            "classifier":  classifier,
+            "classifier": classifier,
             "probability": min_probability,
-            "page":        page,
-            "page_size":   page_size,
+            "page": page,
+            "page_size": page_size,
         }
         if class_name:
             params["class_name"] = class_name
 
         try:
-            resp = requests.get(
-                f"{_ALERCE_API}/objects", params=params, timeout=self.timeout
+            r = requests.get(
+                f"{_ALERCE_API}/objects",
+                params=params,
+                timeout=self.timeout,
             )
-            resp.raise_for_status()
-            data = resp.json()
-            items = data.get("items", data) if isinstance(data, dict) else data
-            return pd.DataFrame(items) if items else pd.DataFrame()
+            if not r.ok:
+                logger.debug(f"REST /objects status={r.status_code}: {r.text[:200]}")
+                return None
+
+            data = r.json()
+            # Handle {"items": [...]} or {"objects": [...]} or plain list
+            if isinstance(data, dict):
+                items = (
+                    data.get("items")
+                    or data.get("objects")
+                    or data.get("results")
+                    or []
+                )
+            elif isinstance(data, list):
+                items = data
+            else:
+                return None
+
+            return pd.DataFrame(items) if items else None
+
         except Exception as exc:
-            logger.debug(f"REST query_objects failed: {exc}")
+            logger.debug(f"REST /objects failed (p{page}): {exc}")
             return None
 
     def get_metadata(self, oid: str) -> Optional[dict]:
-        """Fetch object-level metadata."""
+        """Fetch object-level metadata dict."""
         if self._client is not None:
             try:
                 row = self._client.query_object(oid, format="pandas")
@@ -251,34 +349,34 @@ class AlerceDownloader:
             except Exception:
                 pass
         try:
-            resp = requests.get(
-                f"{_ALERCE_API}/objects/{oid}", timeout=self.timeout
-            )
-            resp.raise_for_status()
-            return resp.json()
+            r = requests.get(f"{_ALERCE_API}/objects/{oid}", timeout=self.timeout)
+            if r.ok:
+                return r.json()
         except Exception as exc:
             logger.warning(f"Could not fetch metadata for {oid}: {exc}")
-            return None
+        return None
 
     def get_probabilities(self, oid: str) -> Optional[pd.DataFrame]:
-        """Return classification probabilities for *oid*."""
+        """Return all classification probabilities for *oid*."""
         if self._client is not None:
             try:
                 return self._client.query_probabilities(oid, format="pandas")
             except Exception:
                 pass
         try:
-            resp = requests.get(
+            r = requests.get(
                 f"{_ALERCE_API}/objects/{oid}/probabilities",
                 timeout=self.timeout,
             )
-            resp.raise_for_status()
-            return pd.DataFrame(resp.json())
+            if r.ok:
+                return pd.DataFrame(r.json())
         except Exception as exc:
             logger.warning(f"Could not fetch probabilities for {oid}: {exc}")
-            return None
+        return None
 
-    # ── internal helpers ──────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Internal helpers
+    # ══════════════════════════════════════════════════════════════════════════
 
     def _fetch_with_retry(self, fn, *args, **kwargs):
         for attempt in range(self.max_retries):
@@ -286,29 +384,13 @@ class AlerceDownloader:
                 return fn(*args, **kwargs)
             except Exception as exc:
                 if attempt < self.max_retries - 1:
-                    time.sleep(self.request_delay * (2 ** attempt))
+                    time.sleep(self.request_delay * (2**attempt))
                 else:
                     logger.warning(
-                        f"{fn.__name__} failed after "
-                        f"{self.max_retries} attempts: {exc}"
+                        f"{fn.__name__} failed after {self.max_retries} "
+                        f"attempts: {exc}"
                     )
         return None
-
-    def _rest_get(
-        self, endpoint: str, result_key: Optional[str] = None
-    ) -> Optional[pd.DataFrame]:
-        try:
-            resp = requests.get(
-                f"{_ALERCE_API}{endpoint}", timeout=self.timeout
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            if result_key:
-                data = data.get(result_key, [])
-            return pd.DataFrame(data) if data else None
-        except Exception as exc:
-            logger.debug(f"REST {endpoint} failed: {exc}")
-            return None
 
     # ── disk cache ────────────────────────────────────────────────────────────
 
@@ -333,14 +415,12 @@ class AlerceDownloader:
         if self._cache_dir is None:
             return
         try:
-            lc.to_parquet(
-                self._cache_path(oid), compression="snappy", index=False
-            )
+            lc.to_parquet(self._cache_path(oid), compression="snappy", index=False)
         except Exception as exc:
             logger.debug(f"Cache write failed for {oid}: {exc}")
 
+    # ── module-level helpers ──────────────────────────────────────────────────────
 
-# ── module-level helpers ──────────────────────────────────────────────────────
 
 def _clean_lightcurve(lc: pd.DataFrame) -> Optional[pd.DataFrame]:
     """Standardise and quality-filter a raw ALeRCE lightcurve DataFrame."""
@@ -350,18 +430,81 @@ def _clean_lightcurve(lc: pd.DataFrame) -> Optional[pd.DataFrame]:
     required = {"mjd", "magpsf", "sigmapsf", "fid"}
     if not required.issubset(lc.columns):
         missing = required - set(lc.columns)
-        logger.debug(f"Missing columns: {missing}")
+        logger.warning(f"Missing columns {missing}. Have: {list(lc.columns)}")
         return None
 
     lc = lc.copy()
+
+    # ── basic quality filters ─────────────────────────────────────────────────
+    n0 = len(lc)
     lc = lc.dropna(subset=["mjd", "magpsf", "sigmapsf", "fid"])
     lc = lc[lc["sigmapsf"] > 0]
     lc = lc[lc["sigmapsf"] < 1.5]
     lc = lc[(lc["magpsf"] > 10) & (lc["magpsf"] < 24)]
     lc["fid"] = lc["fid"].astype(int)
+    logger.warning(f"After quality filters: {n0} -> {len(lc)} rows")
 
+    if lc.empty:
+        return None
+
+    # ── isdiffpos — PERMISSIVE: skip filter if it would remove everything ─────
     if "isdiffpos" in lc.columns:
-        lc = lc[lc["isdiffpos"].isin([1, "1", "t", True])]
+        pos_mask = lc["isdiffpos"].isin([1, "1", "t", "T", True, 1.0]) | (
+            pd.to_numeric(lc["isdiffpos"], errors="coerce") == 1
+        )
+        n_pos = pos_mask.sum()
+        logger.warning(
+            f"isdiffpos: {n_pos}/{len(lc)} positive rows "
+            f"(unique={lc['isdiffpos'].unique()[:5]})"
+        )
+        if n_pos > 0:
+            lc = lc[pos_mask]
+        else:
+            # Don't throw away everything — keep all rows
+            logger.warning("isdiffpos would remove ALL rows — skipping filter")
 
     lc = lc.sort_values("mjd").reset_index(drop=True)
     return lc if not lc.empty else None
+
+
+def _unwrap_alerce_client_lc(
+    raw: pd.DataFrame, oid: str = "?"
+) -> Optional[pd.DataFrame]:
+    """
+    The alerce Python client returns query_lightcurve() as a 1-row DataFrame:
+        columns = ['detections', 'non_detections']
+        raw['detections'].iloc[0] = list of detection dicts  OR  a DataFrame
+
+    This function unwraps that structure into a flat DataFrame.
+    """
+    # ── Case A: already flat (has magpsf directly) ────────────────────────────
+    if "magpsf" in raw.columns:
+        return raw
+
+    # ── Case B: nested {'detections': [...], 'non_detections': [...]} ─────────
+    if "detections" in raw.columns:
+        inner = raw["detections"].iloc[0]
+
+        # inner is a list of dicts
+        if isinstance(inner, list) and inner:
+            df = pd.DataFrame(inner)
+            logger.debug(f"[{oid}] unwrapped client list → {len(df)} rows")
+            return df
+
+        # inner is already a DataFrame
+        if isinstance(inner, pd.DataFrame) and not inner.empty:
+            logger.debug(f"[{oid}] unwrapped client DataFrame → {len(inner)} rows")
+            return inner
+
+        # inner is a dict
+        if isinstance(inner, dict):
+            df = pd.DataFrame([inner])
+            logger.debug(f"[{oid}] unwrapped client dict → {len(df)} rows")
+            return df
+
+    logger.debug(
+        f"[{oid}] Could not unwrap client response. "
+        f"Columns: {list(raw.columns)}, "
+        f"shape: {raw.shape}"
+    )
+    return None
