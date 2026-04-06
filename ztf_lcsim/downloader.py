@@ -1,8 +1,5 @@
 """
 ALeRCE / ZTF data downloader.
-
-Downloads light curves and object metadata from the ALeRCE broker.
-Falls back to direct REST calls if the ``alerce`` package is unavailable.
 """
 
 from __future__ import annotations
@@ -21,7 +18,6 @@ logger = logging.getLogger(__name__)
 
 _ALERCE_API = "https://api.alerce.online/ztf/v1"
 
-# ── optional alerce client ────────────────────────────────────────────────────
 try:
     from alerce.core import Alerce as _AlerceClient
     _HAS_ALERCE = True
@@ -41,13 +37,12 @@ class AlerceDownloader:
     ----------
     cache_dir : str or Path, optional
         Directory for caching downloaded light curves as Parquet files.
-        Set to None to disable caching.
     timeout : int
         HTTP request timeout in seconds.
     max_retries : int
         Number of retries on transient errors.
     request_delay : float
-        Seconds to wait between requests (polite rate limiting).
+        Seconds to wait between requests.
     """
 
     def __init__(
@@ -57,17 +52,15 @@ class AlerceDownloader:
         max_retries: int = 3,
         request_delay: float = 0.1,
     ):
-        self.timeout = timeout
-        self.max_retries = max_retries
+        self.timeout       = timeout
+        self.max_retries   = max_retries
         self.request_delay = request_delay
 
-        # ── cache ─────────────────────────────────────────────────────────────
         self._cache_dir: Optional[Path] = None
         if cache_dir:
             self._cache_dir = Path(cache_dir)
             self._cache_dir.mkdir(parents=True, exist_ok=True)
 
-        # ── alerce client ─────────────────────────────────────────────────────
         self._client = None
         if _HAS_ALERCE:
             try:
@@ -75,26 +68,22 @@ class AlerceDownloader:
             except Exception as exc:
                 logger.warning(f"Could not init alerce client ({exc}); using REST.")
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Light curve access
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── light curve access ────────────────────────────────────────────────────
 
-    def get_lightcurve(self, oid: str, use_cache: bool = True) -> Optional[pd.DataFrame]:
+    def get_lightcurve(
+        self, oid: str, use_cache: bool = True
+    ) -> Optional[pd.DataFrame]:
         """
         Fetch detections for *oid* and return a cleaned DataFrame.
 
-        Columns guaranteed: ``mjd``, ``fid``, ``magpsf``, ``sigmapsf``
-        Optional columns  : ``ra``, ``dec``, ``isdiffpos``
-
+        Guaranteed columns: ``mjd``, ``fid``, ``magpsf``, ``sigmapsf``
         Returns None on failure.
         """
-        # ── cache hit ─────────────────────────────────────────────────────────
         if use_cache and self._cache_dir is not None:
             cached = self._load_from_cache(oid)
             if cached is not None:
                 return cached
 
-        # ── fetch ─────────────────────────────────────────────────────────────
         lc = self._fetch_with_retry(self._download_lightcurve, oid)
         if lc is None:
             return None
@@ -115,8 +104,7 @@ class AlerceDownloader:
         use_cache: bool = True,
         show_progress: bool = True,
     ) -> Dict[str, pd.DataFrame]:
-        """Parallel batch download. Returns dict ``{oid: DataFrame}``."""
-
+        """Parallel batch download. Returns dict {oid: DataFrame}."""
         results: Dict[str, pd.DataFrame] = {}
 
         def _fetch(oid: str):
@@ -129,9 +117,12 @@ class AlerceDownloader:
             if show_progress:
                 it = tqdm(it, total=len(oids), desc="Downloading light curves")
             for fut in it:
-                oid, lc = fut.result()
-                if lc is not None:
-                    results[oid] = lc
+                try:
+                    oid, lc = fut.result()
+                    if lc is not None:
+                        results[oid] = lc
+                except Exception as exc:
+                    logger.debug(f"Batch fetch error: {exc}")
 
         return results
 
@@ -139,16 +130,16 @@ class AlerceDownloader:
         if self._client is not None:
             try:
                 lc = self._client.query_lightcurve(oid, format="pandas")
-                return lc if (lc is not None and not lc.empty) else None
+                if lc is not None and not lc.empty:
+                    return lc
             except Exception as exc:
                 logger.debug(f"alerce client failed for {oid}: {exc}")
 
-        # fallback – REST
-        return self._rest_get(f"/objects/{oid}/lightcurve", result_key="detections")
+        return self._rest_get(
+            f"/objects/{oid}/lightcurve", result_key="detections"
+        )
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Catalog / object queries
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── catalog / object queries ──────────────────────────────────────────────
 
     def query_objects(
         self,
@@ -166,24 +157,15 @@ class AlerceDownloader:
         ----------
         class_name : str, optional
             e.g. ``"RRL"``, ``"LPV"``, ``"SNIa"``
-        classifier : str
-            Which classifier to filter by.
-        min_probability : float
-            Minimum classification probability.
-        max_objects : int, optional
-            Stop after this many objects.
-        page_size : int
-            Objects per API page.
-
-        Returns
-        -------
-        pd.DataFrame
         """
         pages: List[pd.DataFrame] = []
         page = 1
 
-        pbar = tqdm(desc=f"Querying {class_name or 'all'}", unit="obj",
-                    disable=not show_progress)
+        pbar = tqdm(
+            desc=f"Querying {class_name or 'all'}",
+            unit=" obj",
+            disable=not show_progress,
+        )
 
         while True:
             batch = self._fetch_with_retry(
@@ -224,7 +206,7 @@ class AlerceDownloader:
     ) -> Optional[pd.DataFrame]:
         if self._client is not None:
             try:
-                kw = dict(
+                kw: dict = dict(
                     classifier=classifier,
                     probability=min_probability,
                     page=page,
@@ -238,19 +220,19 @@ class AlerceDownloader:
             except Exception as exc:
                 logger.debug(f"alerce client query_objects failed: {exc}")
 
-        # REST fallback
         params: dict = {
-            "classifier": classifier,
+            "classifier":  classifier,
             "probability": min_probability,
-            "page": page,
-            "page_size": page_size,
+            "page":        page,
+            "page_size":   page_size,
         }
         if class_name:
             params["class_name"] = class_name
 
-        url = f"{_ALERCE_API}/objects"
         try:
-            resp = requests.get(url, params=params, timeout=self.timeout)
+            resp = requests.get(
+                f"{_ALERCE_API}/objects", params=params, timeout=self.timeout
+            )
             resp.raise_for_status()
             data = resp.json()
             items = data.get("items", data) if isinstance(data, dict) else data
@@ -260,7 +242,7 @@ class AlerceDownloader:
             return None
 
     def get_metadata(self, oid: str) -> Optional[dict]:
-        """Fetch object-level metadata (coordinates, class, etc.)."""
+        """Fetch object-level metadata."""
         if self._client is not None:
             try:
                 row = self._client.query_object(oid, format="pandas")
@@ -269,8 +251,9 @@ class AlerceDownloader:
             except Exception:
                 pass
         try:
-            resp = requests.get(f"{_ALERCE_API}/objects/{oid}",
-                                timeout=self.timeout)
+            resp = requests.get(
+                f"{_ALERCE_API}/objects/{oid}", timeout=self.timeout
+            )
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:
@@ -285,17 +268,17 @@ class AlerceDownloader:
             except Exception:
                 pass
         try:
-            resp = requests.get(f"{_ALERCE_API}/objects/{oid}/probabilities",
-                                timeout=self.timeout)
+            resp = requests.get(
+                f"{_ALERCE_API}/objects/{oid}/probabilities",
+                timeout=self.timeout,
+            )
             resp.raise_for_status()
             return pd.DataFrame(resp.json())
         except Exception as exc:
             logger.warning(f"Could not fetch probabilities for {oid}: {exc}")
             return None
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # Internal helpers
-    # ══════════════════════════════════════════════════════════════════════════
+    # ── internal helpers ──────────────────────────────────────────────────────
 
     def _fetch_with_retry(self, fn, *args, **kwargs):
         for attempt in range(self.max_retries):
@@ -303,18 +286,21 @@ class AlerceDownloader:
                 return fn(*args, **kwargs)
             except Exception as exc:
                 if attempt < self.max_retries - 1:
-                    wait = self.request_delay * (2 ** attempt)
-                    time.sleep(wait)
+                    time.sleep(self.request_delay * (2 ** attempt))
                 else:
-                    logger.warning(f"{fn.__name__} failed after "
-                                   f"{self.max_retries} attempts: {exc}")
+                    logger.warning(
+                        f"{fn.__name__} failed after "
+                        f"{self.max_retries} attempts: {exc}"
+                    )
         return None
 
     def _rest_get(
         self, endpoint: str, result_key: Optional[str] = None
     ) -> Optional[pd.DataFrame]:
         try:
-            resp = requests.get(f"{_ALERCE_API}{endpoint}", timeout=self.timeout)
+            resp = requests.get(
+                f"{_ALERCE_API}{endpoint}", timeout=self.timeout
+            )
             resp.raise_for_status()
             data = resp.json()
             if result_key:
@@ -333,6 +319,8 @@ class AlerceDownloader:
         return subdir / f"{oid}.parquet"
 
     def _load_from_cache(self, oid: str) -> Optional[pd.DataFrame]:
+        if self._cache_dir is None:
+            return None
         p = self._cache_path(oid)
         if p.exists():
             try:
@@ -342,9 +330,12 @@ class AlerceDownloader:
         return None
 
     def _save_to_cache(self, oid: str, lc: pd.DataFrame):
+        if self._cache_dir is None:
+            return
         try:
-            lc.to_parquet(self._cache_path(oid), compression="snappy",
-                          index=False)
+            lc.to_parquet(
+                self._cache_path(oid), compression="snappy", index=False
+            )
         except Exception as exc:
             logger.debug(f"Cache write failed for {oid}: {exc}")
 
@@ -369,7 +360,6 @@ def _clean_lightcurve(lc: pd.DataFrame) -> Optional[pd.DataFrame]:
     lc = lc[(lc["magpsf"] > 10) & (lc["magpsf"] < 24)]
     lc["fid"] = lc["fid"].astype(int)
 
-    # keep only positive-subtraction detections when the column exists
     if "isdiffpos" in lc.columns:
         lc = lc[lc["isdiffpos"].isin([1, "1", "t", True])]
 
