@@ -1,14 +1,14 @@
 """
-Similarity index – FAISS (preferred) with sklearn fallback.
+Similarity index — FAISS (preferred) with sklearn fallback.
+Supports domain-knowledge feature weights and ML probability augmentation.
 """
 
 from __future__ import annotations
 
 import logging
 import pickle
-import sys
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import List, Optional, Union
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,7 @@ from sklearn.preprocessing import StandardScaler
 
 logger = logging.getLogger(__name__)
 
-# ── FAISS import with detailed diagnostics ────────────────────────────────────
+# ── FAISS import ──────────────────────────────────────────────────────────────
 _HAS_FAISS = False
 _FAISS_ERROR: Optional[str] = None
 
@@ -24,42 +24,20 @@ try:
     import faiss
 
     _HAS_FAISS = True
-
-except ModuleNotFoundError as _e:
+except Exception as _e:
     _FAISS_ERROR = str(_e)
-
     if "numpy._core" in str(_e):
-        # faiss-cpu >= 1.8 needs numpy >= 2.0
         import numpy as _np
 
-        _np_ver = _np.__version__
         logger.warning(
-            f"\n"
-            f"  faiss import failed: {_e}\n"
-            f"  You have numpy {_np_ver}, but faiss-cpu >= 1.8 needs numpy >= 2.0\n"
-            f"\n"
-            f"  Fix (choose one):\n"
-            f"    A) Upgrade numpy:  pip install 'numpy>=2.0'\n"
-            f"    B) Use conda:      conda install -c conda-forge faiss-cpu\n"
-            f"    C) Pin old faiss:  pip install 'faiss-cpu<1.8'\n"
-            f"\n"
-            f"  Falling back to sklearn NearestNeighbors (fully functional, "
-            f"just slower for >500k objects).\n"
+            f"faiss import failed (numpy version mismatch: have {_np.__version__}).\n"
+            f"Fix: conda install -c conda-forge faiss-cpu\n"
+            f"Falling back to sklearn NearestNeighbors."
         )
     else:
         logger.warning(
-            f"faiss not installed ({_e}). "
-            f"Install with:  pip install faiss-cpu  "
-            f"or:  conda install -c conda-forge faiss-cpu\n"
-            f"Falling back to sklearn NearestNeighbors."
+            f"faiss not available ({_e}). " f"Falling back to sklearn NearestNeighbors."
         )
-
-except Exception as _e:
-    _FAISS_ERROR = str(_e)
-    logger.warning(
-        f"faiss available but failed to load ({type(_e).__name__}: {_e}). "
-        f"Falling back to sklearn NearestNeighbors."
-    )
 
 
 class SimilarityIndex:
@@ -72,9 +50,13 @@ class SimilarityIndex:
         ``"flat"`` exact, ``"ivf"`` approximate, ``"hnsw"`` approximate.
     metric : str
         ``"cosine"`` or ``"l2"``.
+    use_feature_weights : bool
+        Apply domain-knowledge feature weights before similarity computation.
+    ml_weight : float
+        Extra weight multiplier applied to ML class probability columns
+        when an ML augmenter is used.
     """
 
-    # ── In SimilarityIndex.__init__, add one parameter ────────────────────────────
     def __init__(
         self,
         index_type: str = "flat",
@@ -82,63 +64,107 @@ class SimilarityIndex:
         ivf_nlist: int = 256,
         ivf_nprobe: int = 32,
         hnsw_m: int = 32,
-        use_feature_weights: bool = True,  # NEW — apply domain-knowledge weights
+        use_feature_weights: bool = True,
+        ml_weight: float = 3.0,
     ):
         self.index_type = index_type
         self.metric = metric
         self.ivf_nlist = ivf_nlist
         self.ivf_nprobe = ivf_nprobe
         self.hnsw_m = hnsw_m
-        self.use_feature_weights = use_feature_weights  # NEW
+        self.use_feature_weights = use_feature_weights
+        self.ml_weight = ml_weight
 
         self._index = None
         self._oids: List[str] = []
-        self._scaler = None
-        self._feature_medians = None
-        self._feature_weights = None  # NEW
+        self._scaler: Optional[StandardScaler] = None
+        self._feature_medians: Optional[np.ndarray] = None
+        self._feature_weights: Optional[np.ndarray] = None
         self._n_features: int = 0
         self._is_built: bool = False
-        self._X_norm = None
+        self._X_norm: Optional[np.ndarray] = None
+        self._ml_augmenter = None
 
-    # ── Replace build() entirely ──────────────────────────────────────────────────
-    def build(self, oids: List[str], features: np.ndarray, verbose: bool = True):
-        """Build the index from a feature matrix."""
+    # ══════════════════════════════════════════════════════════════════════════
+    # Build
+    # ══════════════════════════════════════════════════════════════════════════
+
+    def build(
+        self,
+        oids: List[str],
+        features: np.ndarray,
+        verbose: bool = True,
+        ml_augmenter=None,
+    ):
+        """
+        Build the index from a feature matrix.
+
+        Parameters
+        ----------
+        oids : list of str, length N
+        features : float32 ndarray, shape (N, D)
+        ml_augmenter : MLFeatureAugmenter, optional
+            If provided, class probabilities are appended to features.
+        """
         from .features import get_feature_weights, N_FEATURES
-        from sklearn.preprocessing import StandardScaler
 
         X = np.asarray(features, dtype=np.float32)
         n, d = X.shape
         self._n_features = d
         self._oids = list(oids)
+        self._ml_augmenter = ml_augmenter
 
         if verbose:
             logger.info(f"Building index: {n:,} objects × {d} features")
 
-        # ── impute NaN ────────────────────────────────────────────────────────────
+        # ── impute NaN / Inf ──────────────────────────────────────────────────
         self._feature_medians = np.nanmedian(X, axis=0).astype(np.float32)
         X = _impute(X, self._feature_medians)
 
-        # ── standardise ───────────────────────────────────────────────────────────
+        # ── ML augmentation ────────────────────────────────────────────────────
+        if ml_augmenter is not None and ml_augmenter.is_fitted:
+            proba = ml_augmenter.predict_proba(X)  # (N, n_classes)
+            if verbose:
+                logger.info(
+                    f"ML augmentation: +{proba.shape[1]} class probability "
+                    f"features  classes={ml_augmenter.classes_}"
+                )
+            X = np.hstack([X, proba]).astype(np.float32)
+        else:
+            if verbose and ml_augmenter is not None:
+                logger.warning("ML augmenter provided but not fitted — skipping.")
+
+        # ── standardise ───────────────────────────────────────────────────────
         self._scaler = StandardScaler()
         X = self._scaler.fit_transform(X).astype(np.float32)
 
-        # ── apply domain-knowledge feature weights ────────────────────────────────
-        if self.use_feature_weights and d == N_FEATURES:
-            self._feature_weights = get_feature_weights()
-            X = (X * self._feature_weights).astype(np.float32)
-            if verbose:
-                # show top-5 most weighted features
-                top5 = np.argsort(self._feature_weights)[::-1][:5]
-                from .features import FEATURE_NAMES
+        # ── domain-knowledge + ML feature weights ─────────────────────────────
+        if self.use_feature_weights:
+            base_w = get_feature_weights()  # shape (D,)
+            total_d = X.shape[1]
+            if total_d > len(base_w):
+                # ML probability columns
+                n_prob = total_d - len(base_w)
+                prob_w = np.full(n_prob, self.ml_weight, dtype=np.float32)
+                self._feature_weights = np.concatenate([base_w, prob_w])
+            else:
+                self._feature_weights = base_w[:total_d]
 
-                top5_names = [
-                    (FEATURE_NAMES[i], self._feature_weights[i]) for i in top5
-                ]
-                logger.info(f"Top-5 weighted features: {top5_names}")
+            self._feature_weights = (
+                self._feature_weights / self._feature_weights.mean()
+            ).astype(np.float32)
+            X = (X * self._feature_weights).astype(np.float32)
+
+            if verbose:
+                top5 = np.argsort(self._feature_weights)[::-1][:5]
+                logger.info(
+                    f"Top-5 weight indices: {top5.tolist()} "
+                    f"(values: {self._feature_weights[top5].tolist()})"
+                )
         else:
             self._feature_weights = None
 
-        # ── L2-normalise for cosine similarity ───────────────────────────────────
+        # ── L2-normalise for cosine similarity ────────────────────────────────
         if self.metric == "cosine":
             norms = np.linalg.norm(X, axis=1, keepdims=True)
             norms = np.where(norms == 0, 1.0, norms)
@@ -146,8 +172,9 @@ class SimilarityIndex:
 
         self._X_norm = X.copy()
 
+        # ── build index ───────────────────────────────────────────────────────
         if _HAS_FAISS:
-            self._index = self._build_faiss(X, d, n)
+            self._index = self._build_faiss(X, X.shape[1], n)
         else:
             self._index = self._build_sklearn(X)
 
@@ -167,7 +194,7 @@ class SimilarityIndex:
         elif self.index_type == "hnsw":
             idx = faiss.IndexHNSWFlat(d, self.hnsw_m)
         else:
-            raise ValueError(f"Unknown index type: {self.index_type!r}")
+            raise ValueError(f"Unknown index_type: {self.index_type!r}")
         idx.add(X)
         return idx
 
@@ -179,23 +206,56 @@ class SimilarityIndex:
         nn.fit(X)
         return nn
 
-    # ── search ────────────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Search
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # ── Update search() to apply weights to query vector too ─────────────────────
-    def search(self, query_features, k=20, exclude_self=True):
+    def search(
+        self,
+        query_features: np.ndarray,
+        k: int = 20,
+        exclude_self: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Return the k most similar objects.
+
+        Parameters
+        ----------
+        query_features : ndarray, shape (D,) or (1, D)
+        k : int
+        exclude_self : bool
+            Exclude the query if it is in the index (distance ≈ 0).
+
+        Returns
+        -------
+        pd.DataFrame with columns: rank, oid, distance, similarity
+        """
         if not self._is_built:
-            raise RuntimeError("Index not built.")
+            raise RuntimeError("Index not built. Call build() first.")
 
         q = np.asarray(query_features, dtype=np.float32).reshape(1, -1)
-        q = _impute(q, self._feature_medians)
+
+        # impute using raw-feature medians (before ML / scaling)
+        med = self._feature_medians
+        q = _impute(q, med[: q.shape[1]] if med is not None else med)
+
+        # ML augmentation (must match build-time transform)
+        if self._ml_augmenter is not None and self._ml_augmenter.is_fitted:
+            proba = self._ml_augmenter.predict_proba(q)
+            q = np.hstack([q, proba]).astype(np.float32)
+
+        # standardise
         q = self._scaler.transform(q).astype(np.float32)
 
-        # apply same weights as during build
+        # feature weights
         if self._feature_weights is not None:
-            q = (q * self._feature_weights).astype(np.float32)
+            fw = self._feature_weights
+            if q.shape[1] <= len(fw):
+                q = (q * fw[: q.shape[1]]).astype(np.float32)
 
+        # L2-normalise
         if self.metric == "cosine":
-            norm = np.linalg.norm(q)
+            norm = float(np.linalg.norm(q))
             if norm > 0:
                 q = q / norm
 
@@ -216,14 +276,15 @@ class SimilarityIndex:
 
         if exclude_self:
             results = [(o, d) for o, d in results if d > 1e-6]
-
         results = results[:k]
+
         df = pd.DataFrame(results, columns=["oid", "distance"])
         df.insert(0, "rank", range(1, len(df) + 1))
         if self.metric == "cosine":
             df["similarity"] = (1.0 - df["distance"] / 2.0).clip(0, 1)
         else:
             df["similarity"] = 1.0 / (1.0 + df["distance"])
+
         return df
 
     def search_by_oid(self, oid: str, k: int = 20) -> pd.DataFrame:
@@ -236,13 +297,17 @@ class SimilarityIndex:
         elif _HAS_FAISS:
             vec = self._index.reconstruct(idx)
         else:
-            raise RuntimeError("Cannot reconstruct vector without stored X_norm.")
+            raise RuntimeError(
+                "search_by_oid unavailable with sklearn backend without stored X_norm."
+            )
         return self.search(vec, k=k, exclude_self=True)
 
-    # ── persistence ───────────────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════════════════
+    # Persistence
+    # ══════════════════════════════════════════════════════════════════════════
 
     def save(self, path: Union[str, Path]):
-        """Save the index to disk."""
+        """Save index and all metadata to disk."""
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -250,11 +315,14 @@ class SimilarityIndex:
             "oids": self._oids,
             "scaler": self._scaler,
             "feature_medians": self._feature_medians,
+            "feature_weights": self._feature_weights,
             "n_features": self._n_features,
             "index_type": self.index_type,
             "metric": self.metric,
             "is_built": self._is_built,
             "X_norm": self._X_norm,
+            "ml_weight": self.ml_weight,
+            "ml_augmenter": self._ml_augmenter,
         }
 
         if _HAS_FAISS and self._index is not None:
@@ -276,8 +344,8 @@ class SimilarityIndex:
 
         if not Path(meta_path).exists():
             raise FileNotFoundError(
-                f"Index metadata not found at {meta_path}\n"
-                "Run scripts/02_build_index.py first."
+                f"Index not found at {meta_path}\n"
+                "Run:  python scripts/02_build_index.py"
             )
 
         with open(meta_path, "rb") as fh:
@@ -286,11 +354,14 @@ class SimilarityIndex:
         self._oids = meta["oids"]
         self._scaler = meta["scaler"]
         self._feature_medians = meta["feature_medians"]
+        self._feature_weights = meta.get("feature_weights")
         self._n_features = meta["n_features"]
         self.index_type = meta["index_type"]
         self.metric = meta["metric"]
         self._is_built = meta["is_built"]
         self._X_norm = meta.get("X_norm")
+        self.ml_weight = meta.get("ml_weight", 3.0)
+        self._ml_augmenter = meta.get("ml_augmenter")
 
         if "faiss_path" in meta and _HAS_FAISS:
             self._index = faiss.read_index(meta["faiss_path"])
@@ -299,8 +370,14 @@ class SimilarityIndex:
         else:
             self._index = meta.get("sklearn_index")
 
-        logger.info(f"Index loaded: {len(self._oids):,} objects")
+        logger.info(
+            f"Index loaded: {len(self._oids):,} objects "
+            f"({'FAISS' if _HAS_FAISS else 'sklearn'}) "
+            f"ml={'yes' if self._ml_augmenter is not None else 'no'}"
+        )
         return self
+
+    # ── properties ────────────────────────────────────────────────────────────
 
     @property
     def n_objects(self) -> int:
@@ -311,16 +388,34 @@ class SimilarityIndex:
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+# ── replace _impute() at the bottom of ztf_lcsim/index.py ───────────────────
 
 
-def _impute(X: np.ndarray, medians: np.ndarray) -> np.ndarray:
-    """Replace NaN/Inf with column medians."""
+def _impute(X: np.ndarray, medians: Optional[np.ndarray]) -> np.ndarray:
+    """
+    Replace NaN / Inf with column medians.
+    Columns where ALL values are NaN are filled with 0.
+    """
     X = X.copy()
+    if medians is None:
+        return np.where(np.isfinite(X), X, 0.0).astype(X.dtype)
+
     nan_mask = ~np.isfinite(X)
-    if nan_mask.any():
-        col_idx = np.where(nan_mask.any(axis=0))[0]
-        for c in col_idx:
-            rows = nan_mask[:, c]
-            fill = medians[c] if np.isfinite(medians[c]) else 0.0
-            X[rows, c] = fill
+    if not nan_mask.any():
+        return X
+
+    n_cols = min(X.shape[1], len(medians))
+    for c in range(n_cols):
+        rows = nan_mask[:, c]
+        if not rows.any():
+            continue
+        fill = float(medians[c]) if np.isfinite(medians[c]) else 0.0
+        X[rows, c] = fill
+
+    # any columns beyond the medians array length
+    for c in range(n_cols, X.shape[1]):
+        rows = nan_mask[:, c]
+        if rows.any():
+            X[rows, c] = 0.0
+
     return X

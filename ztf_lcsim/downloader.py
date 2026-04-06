@@ -442,7 +442,7 @@ def _clean_lightcurve(lc: pd.DataFrame) -> Optional[pd.DataFrame]:
     lc = lc[lc["sigmapsf"] < 1.5]
     lc = lc[(lc["magpsf"] > 10) & (lc["magpsf"] < 24)]
     lc["fid"] = lc["fid"].astype(int)
-    logger.warning(f"After quality filters: {n0} -> {len(lc)} rows")
+    logger.debug(f"After quality filters: {n0} -> {len(lc)} rows")
 
     if lc.empty:
         return None
