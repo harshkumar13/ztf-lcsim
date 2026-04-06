@@ -2,13 +2,23 @@
 """
 Step 1 – Download ZTF light curves from ALeRCE and build the feature database.
 
-Usage
------
+Usage examples
+--------------
+# comma-separated (single flag)
+python scripts/01_build_database.py --classes RRL,LPV,EB
+
+# repeated flags  
+python scripts/01_build_database.py --classes RRL --classes LPV --classes EB
+
+# all default classes from config.yaml
+python scripts/01_build_database.py
+
+# with overrides
 python scripts/01_build_database.py \\
-    --config config.yaml \\
-    --classes RRL LPV EB \\
+    --classes RRL,LPV \\
     --max-per-class 5000 \\
-    --n-workers 4
+    --min-prob 0.7 \\
+    --n-workers 8
 """
 
 from __future__ import annotations
@@ -17,7 +27,6 @@ import logging
 import sys
 from pathlib import Path
 
-# Make sure the package root is on the path when running as a script
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import click
@@ -38,43 +47,86 @@ logging.basicConfig(
 logger = logging.getLogger("build_database")
 
 
+def _parse_classes(classes_tuple: tuple, config_classes: list) -> list:
+    """
+    Accept any of these formats and always return a plain list of strings:
+        --classes RRL,LPV,EB          → ["RRL", "LPV", "EB"]
+        --classes RRL --classes LPV   → ["RRL", "LPV"]
+        (nothing given)               → config_classes
+    """
+    if not classes_tuple:
+        return list(config_classes)
+
+    result = []
+    for item in classes_tuple:
+        # each item may itself be "RRL,LPV" if user used commas
+        for part in item.split(","):
+            part = part.strip()
+            if part:
+                result.append(part)
+    return result
+
+
 @click.command()
-@click.option("--config",        default="config.yaml", show_default=True)
-@click.option("--classes",       multiple=True,
-              help="ZTF object classes to include (e.g. RRL LPV EB). "
-                   "Default: from config.")
-@click.option("--max-per-class", default=None, type=int,
-              help="Override max_per_class from config.")
-@click.option("--min-prob",      default=None, type=float,
-              help="Override min_probability from config.")
-@click.option("--n-workers",     default=None, type=int,
-              help="Parallel download workers.")
-@click.option("--resume/--no-resume", default=True, show_default=True,
-              help="Skip objects already in the database.")
-@click.option("--dry-run",       is_flag=True,
-              help="Only print what would be done; don't download.")
+@click.option(
+    "--config", default="config.yaml", show_default=True,
+    help="Path to config.yaml",
+)
+@click.option(
+    "--classes", multiple=True, metavar="CLASS[,CLASS,...]",
+    help=(
+        "ZTF object classes to include. "
+        "Can be comma-separated ('RRL,LPV') or repeated ('--classes RRL --classes LPV'). "
+        "Default: all classes in config.yaml."
+    ),
+)
+@click.option(
+    "--max-per-class", "max_per_class", default=None, type=int,
+    help="Max objects per class (overrides config).",
+)
+@click.option(
+    "--min-prob", "min_prob", default=None, type=float,
+    help="Min classification probability (overrides config).",
+)
+@click.option(
+    "--n-workers", "n_workers", default=None, type=int,
+    help="Parallel download workers (overrides config).",
+)
+@click.option(
+    "--resume/--no-resume", default=True, show_default=True,
+    help="Skip objects already in the database.",
+)
+@click.option(
+    "--dry-run", is_flag=True,
+    help="Print what would be done without downloading anything.",
+)
 def cli(config, classes, max_per_class, min_prob, n_workers, resume, dry_run):
     """Download ZTF light curves and build the feature database."""
 
     cfg = Config(config)
 
     # ── resolve parameters ────────────────────────────────────────────────────
-    classes_list  = list(classes) if classes else cfg.catalog.classes
+    classes_list  = _parse_classes(classes, cfg.catalog.classes)
     max_per_class = max_per_class or cfg.catalog.max_per_class
     min_prob      = min_prob      or cfg.catalog.min_probability
     n_workers     = n_workers     or cfg.catalog.n_workers
 
     cfg.db_dir.mkdir(parents=True, exist_ok=True)
 
-    logger.info(f"Config      : {config}")
-    logger.info(f"Classes     : {classes_list}")
-    logger.info(f"Max/class   : {max_per_class}")
-    logger.info(f"Min prob    : {min_prob}")
-    logger.info(f"Workers     : {n_workers}")
-    logger.info(f"Output dir  : {cfg.db_dir}")
+    logger.info("=" * 60)
+    logger.info("  ZTF Light Curve Similarity — Build Database")
+    logger.info("=" * 60)
+    logger.info(f"  Config file  : {config}")
+    logger.info(f"  Classes      : {classes_list}")
+    logger.info(f"  Max/class    : {max_per_class:,}")
+    logger.info(f"  Min prob     : {min_prob}")
+    logger.info(f"  Workers      : {n_workers}")
+    logger.info(f"  Resume       : {resume}")
+    logger.info(f"  Output dir   : {cfg.db_dir}")
+    logger.info("=" * 60)
 
     if dry_run:
-        logger.info("DRY RUN – exiting.")
+        logger.info("DRY RUN — exiting without downloading.")
         return
 
     # ── initialise components ─────────────────────────────────────────────────
@@ -99,20 +151,22 @@ def cli(config, classes, max_per_class, min_prob, n_workers, resume, dry_run):
     )
 
     # ── pre-load existing OIDs ────────────────────────────────────────────────
-    existing_oids: set[str] = set()
+    existing_oids: set = set()
     if resume and cfg.features_path.exists():
         existing, _ = db.load_all()
         existing_oids = set(existing)
-        logger.info(f"Database has {len(existing_oids):,} existing objects "
-                    "(--resume is on)")
+        logger.info(
+            f"Resume mode: {len(existing_oids):,} objects already in database"
+        )
 
     # ── process each class ────────────────────────────────────────────────────
     total_added = 0
 
     for cls in classes_list:
-        logger.info(f"── Class: {cls} ──────────────────────────────────────")
+        logger.info("")
+        logger.info(f"── Class: {cls} " + "─" * 40)
 
-        # Query catalog
+        # ── query catalog ─────────────────────────────────────────────────────
         catalog = downloader.query_objects(
             class_name=cls,
             min_probability=min_prob,
@@ -120,34 +174,48 @@ def cli(config, classes, max_per_class, min_prob, n_workers, resume, dry_run):
         )
 
         if catalog.empty:
-            logger.warning(f"  No objects returned for class {cls}")
+            logger.warning(f"  No objects returned for class '{cls}' — skipping")
             continue
 
         oid_col = _find_oid_col(catalog)
         if oid_col is None:
-            logger.warning(f"  Cannot find OID column in catalog; skipping {cls}")
+            logger.warning(
+                f"  Cannot find OID column in catalog "
+                f"(columns: {list(catalog.columns)}) — skipping '{cls}'"
+            )
             continue
 
         oids = catalog[oid_col].tolist()
-        logger.info(f"  Found {len(oids):,} objects")
+        logger.info(f"  Catalog returned : {len(oids):,} objects")
 
-        # Skip already-processed
+        # ── skip already-processed ────────────────────────────────────────────
         if resume:
-            oids = [o for o in oids if o not in existing_oids]
-            logger.info(f"  {len(oids):,} new objects to process")
+            oids_new = [o for o in oids if o not in existing_oids]
+            logger.info(
+                f"  Already in DB    : {len(oids) - len(oids_new):,}"
+            )
+            logger.info(f"  New to process   : {len(oids_new):,}")
+            oids = oids_new
 
         if not oids:
+            logger.info("  Nothing new to process — skipping")
             continue
 
-        # Download in batches
-        BATCH = 500
-        for batch_start in range(0, len(oids), BATCH):
-            batch_oids = oids[batch_start: batch_start + BATCH]
-            logger.info(f"  Downloading batch "
-                        f"{batch_start // BATCH + 1}/"
-                        f"{len(oids) // BATCH + 1} "
-                        f"({len(batch_oids)} objects)")
+        # ── process in batches ────────────────────────────────────────────────
+        BATCH_SIZE = 500
+        n_batches  = max(1, (len(oids) + BATCH_SIZE - 1) // BATCH_SIZE)
 
+        for batch_i in range(n_batches):
+            batch_oids = oids[batch_i * BATCH_SIZE : (batch_i + 1) * BATCH_SIZE]
+            if not batch_oids:
+                continue
+
+            logger.info(
+                f"  Batch {batch_i + 1}/{n_batches} "
+                f"({len(batch_oids)} objects)"
+            )
+
+            # download
             lcs = downloader.get_lightcurves_batch(
                 batch_oids,
                 n_workers=n_workers,
@@ -155,28 +223,35 @@ def cli(config, classes, max_per_class, min_prob, n_workers, resume, dry_run):
             )
 
             if not lcs:
+                logger.warning("  No light curves retrieved for this batch")
                 continue
 
-            # Extract features
-            feat_oids, feat_matrix = extractor.extract_batch(lcs)
+            logger.info(
+                f"  Downloaded : {len(lcs):,}/{len(batch_oids)} successfully"
+            )
 
-            if len(feat_oids) == 0:
+            # extract features
+            feat_oids, feat_matrix = extractor.extract_batch(
+                lcs, show_progress=True
+            )
+
+            if not feat_oids:
+                logger.warning("  No features extracted for this batch")
                 continue
 
-            # Build metadata DataFrame for this batch
+            # build metadata
             meta_rows = []
             for oid in feat_oids:
-                lc = lcs[oid]
+                lc  = lcs[oid]
                 row = {
-                    "oid": oid,
-                    "cls": cls,
+                    "oid":         oid,
+                    "cls":         cls,
                     "probability": _get_prob(catalog, oid_col, oid),
-                    "n_obs_g": int((lc["fid"] == 1).sum()),
-                    "n_obs_r": int((lc["fid"] == 2).sum()),
+                    "n_obs_g":     int((lc["fid"] == 1).sum()),
+                    "n_obs_r":     int((lc["fid"] == 2).sum()),
                 }
-                # add ra/dec if available
                 if "ra" in lc.columns:
-                    row["ra"] = float(lc["ra"].median())
+                    row["ra"]  = float(lc["ra"].median())
                 if "dec" in lc.columns:
                     row["dec"] = float(lc["dec"].median())
                 meta_rows.append(row)
@@ -186,30 +261,45 @@ def cli(config, classes, max_per_class, min_prob, n_workers, resume, dry_run):
             existing_oids.update(feat_oids)
             total_added += len(feat_oids)
 
-            logger.info(f"    → Added {len(feat_oids):,} objects "
-                        f"(total in DB: {len(existing_oids):,})")
+            logger.info(
+                f"  ✓ Added {len(feat_oids):,} | "
+                f"Total in DB: {len(existing_oids):,}"
+            )
 
-    logger.info(f"Done. Added {total_added:,} objects in this run.")
+    # ── summary ───────────────────────────────────────────────────────────────
+    logger.info("")
+    logger.info("=" * 60)
+    logger.info(f"  Done. Added {total_added:,} objects this run.")
     stats = db.stats()
-    logger.info(f"Database stats: {stats}")
+    logger.info(f"  Total in DB : {stats['n_objects']:,}")
+    if stats["class_counts"]:
+        logger.info("  Class breakdown:")
+        for cls_name, cnt in sorted(stats["class_counts"].items()):
+            logger.info(f"    {cls_name:<12} {cnt:>6,}")
+    logger.info("=" * 60)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
 def _find_oid_col(df: pd.DataFrame) -> str | None:
-    for c in ("oid", "objectId", "object_id", "id"):
+    """Find the object-ID column regardless of its exact name."""
+    for c in ("oid", "objectId", "object_id", "id", "ZTF_id"):
         if c in df.columns:
             return c
     return None
 
 
-def _get_prob(catalog: pd.DataFrame, oid_col: str, oid: str) -> float | None:
+def _get_prob(
+    catalog: pd.DataFrame, oid_col: str, oid: str
+) -> float | None:
+    """Extract classification probability for a single OID."""
     mask = catalog[oid_col] == oid
-    if mask.any():
-        row = catalog[mask].iloc[0]
-        for col in ("probability", "prob", "lc_classifier_top_probability"):
-            if col in row.index:
-                return float(row[col])
+    if not mask.any():
+        return None
+    row = catalog[mask].iloc[0]
+    for col in ("probability", "prob", "lc_classifier_top_probability"):
+        if col in row.index and pd.notna(row[col]):
+            return float(row[col])
     return None
 
 
