@@ -1,0 +1,8 @@
+# MANIFEST.in
+include README.md
+include LICENSE
+include config.yaml
+include requirements.txt
+recursive-include ztf_lcsim *.py
+recursive-include scripts *.py
+recursive-include examples *.py
